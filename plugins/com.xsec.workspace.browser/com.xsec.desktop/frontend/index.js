@@ -73,7 +73,7 @@ class BrowserController {
   }
   async dispose() {
     this.disposed = true; this.invalidateRefresh(); this.clearTimer(); this.clearPendingMove(); window.removeEventListener("keydown", this.onEscape); document.removeEventListener("visibilitychange", this.onVisibilityChange);
-    await this.setFocus(false); await this.closeSurface(); this.root?.replaceChildren(); console.debug("browser.frontend.disposed");
+    if (!this.settingsPage()) { await this.setFocus(false); await this.closeSurface(); } this.root?.replaceChildren(); console.debug("browser.frontend.disposed");
   }
   settingsPage() { return this.context.kind === "settings-page"; }
   binding() { return this.context.workspace?.binding || {}; }
@@ -83,6 +83,7 @@ class BrowserController {
   surfaceKey(sessionId, pageId) { return `${sessionId}:${pageId}`; }
   clearTimer() { if (this.timer) window.clearTimeout(this.timer); this.timer = 0; }
   clearPendingMove() { if (this.moveTimer) window.clearTimeout(this.moveTimer); this.moveTimer = 0; this.pendingMove = undefined; this.pressedPointers.clear(); }
+  clearSurfaceInput() { this.clearPendingMove(); this.pressedKeys.clear(); this.inputTail = Promise.resolve(); }
   invalidateRefresh() { this.revision += 1; if (this.refreshing) this.refreshQueued = true; }
   schedule(delay) { this.clearTimer(); if (this.visible() && !this.state.error) this.timer = window.setTimeout(() => void this.refresh(), delay); }
   clearSurfaceError() { this.surfaceErrorKey = ""; this.state.surfaceError = ""; if (["error", "closed"].includes(this.state.surfaceState)) this.state.surfaceState = ""; }
@@ -153,7 +154,7 @@ class BrowserController {
     await this.action("close", async () => { await this.host.request("xsec.browser.page.close", { browserSessionId: session.id, pageId: id }); if (next) { this.state.follow = false; this.state.pageId = next; this.clearSurfaceError(); this.updateAddress(); } });
   }
   async closeSurface(clearState = true, invalidate = true) {
-    const surface = this.surface; const subscription = this.subscription; if (invalidate) this.surfaceGeneration += 1; this.surface = undefined; this.subscription = undefined; this.clearPendingMove(); this.pressedKeys.clear(); this.inputTail = Promise.resolve(); subscription?.dispose?.();
+    const surface = this.surface; const subscription = this.subscription; if (invalidate) this.surfaceGeneration += 1; this.surface = undefined; this.subscription = undefined; this.clearSurfaceInput(); subscription?.dispose?.();
     if (clearState) this.state.surfaceState = ""; if (surface) { console.debug("browser.surface.close.started", { pageId: surface.pageId }); await this.host.request("xsec.browser.surface.close", { surfaceId: surface.id }); }
   }
   surfaceRequestCurrent(generation, sessionId, pageId) { return generation === this.surfaceGeneration && this.visible() && this.session()?.id === sessionId && this.page()?.id === pageId; }
@@ -183,7 +184,7 @@ class BrowserController {
   }
   async presentEvent(event, surfaceId) {
     if (event.kind === "error") throw new Error(event.message || "真实浏览器画面不可用");
-    if (event.kind === "closed") { const surface = this.surface; if (!surface || surface.id !== surfaceId) return; this.subscription?.dispose?.(); this.subscription = undefined; this.surface = undefined; this.surfaceErrorKey = this.surfaceKey(surface.sessionId, surface.pageId); this.state.surfaceState = "closed"; this.render(); return; }
+    if (event.kind === "closed") { const surface = this.surface; if (!surface || surface.id !== surfaceId) return; this.subscription?.dispose?.(); this.subscription = undefined; this.surface = undefined; this.clearSurfaceInput(); this.surfaceErrorKey = this.surfaceKey(surface.sessionId, surface.pageId); this.state.surfaceState = "closed"; this.render(); return; }
     if (this.state.surfaceState !== "live") { this.state.surfaceState = "live"; this.render(); }
   }
   async presentFrame(frame, surfaceId) {
@@ -200,7 +201,7 @@ class BrowserController {
   }
   async setFocus(focus) {
     this.focusTarget = focus; const revision = ++this.focusRevision;
-    const apply = async () => { await this.host.request("xsec.browser.presentation.set", { focus }); if (revision === this.focusRevision) { this.state.focus = focus; this.render(); } };
+    const apply = async () => { try { await this.host.request("xsec.browser.presentation.set", { focus }); if (revision === this.focusRevision) { this.state.focus = focus; this.render(); } } catch (error) { if (revision === this.focusRevision) this.focusTarget = this.state.focus; throw error; } };
     this.focusTail = this.focusTail.then(apply, apply); return this.focusTail;
   }
   sendInput(input) {
@@ -254,7 +255,7 @@ function pageTab(controller, page) {
   const tab = element("div", `tab${page.id === controller.state.pageId ? " active" : ""}`); const open = element("button", "tab-open"); const close = element("button", "close", "×");
   open.type = "button"; open.setAttribute("role", "tab"); open.setAttribute("aria-selected", String(page.id === controller.state.pageId)); open.append(element("span", "", "◉"), element("span", "label", pageLabel(page)));
   const groups = controller.state.groups.filter((group) => group.current_page_id === page.id); if (groups.length) open.append(element("em", "owner", groups.some((group) => group.owner === "parent") ? "主" : "子"));
-  open.onclick = () => void controller.choosePage(page.id).catch((error) => controller.fail(error, "page-select")); close.type = "button"; close.setAttribute("aria-label", `关闭 ${pageLabel(page)}`); close.onclick = () => void controller.closePage(page.id); tab.append(open, close); return tab;
+  open.onclick = () => void controller.choosePage(page.id).catch((error) => controller.fail(error, "page-select")); close.type = "button"; close.setAttribute("aria-label", `关闭 ${pageLabel(page)}`); close.disabled = Boolean(controller.state.busy); close.onclick = () => void controller.closePage(page.id); tab.append(open, close); return tab;
 }
 function icon(text, label, handler) {
   const button = element("button", "icon", text); button.type = "button"; button.setAttribute("aria-label", label); button.onclick = handler; return button;
@@ -276,7 +277,7 @@ function workspaceControls(controller) {
 function bindSurfaceInput(controller, canvas, keyboard) {
   canvas.oncontextmenu = (event) => event.preventDefault();
   canvas.onpointerdown = (event) => { const button = mouseButton(event.button); controller.pressedPointers.set(event.pointerId, button); canvas.setPointerCapture(event.pointerId); keyboard.focus({ preventScroll: true }); const point = controller.point(event); void controller.sendInput({ kind: "mouse", event_type: "down", ...point, button, buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
-  const releasePointer = async (event) => { const button = controller.pressedPointers.get(event.pointerId) || mouseButton(event.button); controller.pressedPointers.delete(event.pointerId); await controller.flushPendingMove(); const point = controller.point(event); await controller.sendInput({ kind: "mouse", event_type: "up", ...point, button, buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
+  const releasePointer = async (event) => { const button = controller.pressedPointers.get(event.pointerId); if (!button) return; controller.pressedPointers.delete(event.pointerId); await controller.flushPendingMove(); const point = controller.point(event); await controller.sendInput({ kind: "mouse", event_type: "up", ...point, button, buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
   canvas.onpointerup = (event) => void releasePointer(event);
   canvas.onpointercancel = (event) => void releasePointer(event);
   canvas.onpointermove = (event) => { const point = controller.point(event); controller.queueMove({ kind: "mouse", event_type: "move", ...point, button: "none", buttons: event.buttons, modifiers: eventModifiers(event) }); };
