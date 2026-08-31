@@ -55,9 +55,9 @@ class BrowserController {
     this.host = host; this.context = host.context || {}; this.key = workspaceKey(this.context);
     this.state = { sessions: [], sessionId: null, userSelected: false, pages: [], groups: [], pageId: null, pageUrl: null, follow: true, focus: false, address: "", error: "", surfaceError: "", busy: "", loading: true, pending: null, observed: null, surfaceState: "" };
     this.timer = 0; this.revision = 0; this.refreshing = false; this.refreshQueued = false; this.disposed = false; this.surface = undefined; this.subscription = undefined; this.surfaceGeneration = 0; this.surfaceErrorKey = "";
-    this.moveTimer = 0; this.pendingMove = undefined; this.inputTail = Promise.resolve(); this.composing = false; this.ignoredText = undefined; this.pressedKeys = new Set(); this.mouseButtons = 0; this.frameSurfaceId = ""; this.nextFrameAckAt = 0; this.focusTail = Promise.resolve(); this.focusTarget = false; this.focusRevision = 0; this.settingsReady = false; this.settingsRevision = 0;
+    this.moveTimer = 0; this.pendingMove = undefined; this.inputTail = Promise.resolve(); this.composing = false; this.ignoredText = undefined; this.pressedKeys = new Map(); this.mouseButtons = 0; this.frameSurfaceId = ""; this.nextFrameAckAt = 0; this.focusTail = Promise.resolve(); this.focusTarget = false; this.focusRevision = 0; this.settingsReady = false; this.settingsRevision = 0;
     this.onEscape = (event) => { if (this.focusTarget && event.key === "Escape") void this.setFocus(false).catch((error) => this.fail(error, "presentation")); };
-    this.onVisibilityChange = () => void this.handleVisibilityChange();
+    this.onVisibilityChange = () => void this.handleVisibilityChange(); this.onWindowBlur = () => this.releasePressedKeys();
   }
   mount(root, context) {
     this.root = root; this.context = context || this.context;
@@ -72,7 +72,7 @@ class BrowserController {
     else await this.teardownWorkspace();
   }
   async dispose() {
-    this.disposed = true; this.invalidateRefresh(); this.clearTimer(); this.clearPendingMove(); window.removeEventListener("keydown", this.onEscape); document.removeEventListener("visibilitychange", this.onVisibilityChange); try { if (!this.settingsPage()) await this.teardownWorkspace(); } finally { this.root?.replaceChildren(); } console.debug("browser.frontend.disposed");
+    this.disposed = true; this.invalidateRefresh(); this.clearTimer(); this.clearPendingMove(); window.removeEventListener("keydown", this.onEscape); window.removeEventListener("blur", this.onWindowBlur); document.removeEventListener("visibilitychange", this.onVisibilityChange); try { if (!this.settingsPage()) await this.teardownWorkspace(); } finally { this.root?.replaceChildren(); } console.debug("browser.frontend.disposed");
   }
   settingsPage() { return this.context.kind === "settings-page"; }
   binding() { return this.context.workspace?.binding || {}; }
@@ -82,7 +82,7 @@ class BrowserController {
   surfaceKey(sessionId, pageId) { return `${sessionId}:${pageId}`; }
   clearTimer() { if (this.timer) window.clearTimeout(this.timer); this.timer = 0; }
   clearPendingMove() { if (this.moveTimer) window.clearTimeout(this.moveTimer); this.moveTimer = 0; this.pendingMove = undefined; this.mouseButtons = 0; }
-  clearSurfaceInput() { this.clearPendingMove(); this.pressedKeys.clear(); this.inputTail = Promise.resolve(); }
+  clearSurfaceInput() { this.clearPendingMove(); this.pressedKeys.clear(); this.inputTail = Promise.resolve(); } releasePressedKeys() { const held = [...this.pressedKeys.values()]; this.pressedKeys.clear(); held.forEach((input) => void this.sendInput({ ...input, event_type: "up", auto_repeat: false })); }
   invalidateRefresh() { this.revision += 1; if (this.refreshing) this.refreshQueued = true; }
   schedule(delay) { this.clearTimer(); if (this.visible() && !this.state.error) this.timer = window.setTimeout(() => void this.refresh(), delay); }
   clearSurfaceError() { this.surfaceErrorKey = ""; this.state.surfaceError = ""; if (["error", "closed"].includes(this.state.surfaceState)) this.state.surfaceState = ""; }
@@ -127,9 +127,9 @@ class BrowserController {
   }
   fail(error, stage) { console.error(`browser.${stage}.failed`, { message: errorText(error) }); this.state.error = errorText(error); this.render(); }
   async action(name, operation) {
-    const startedAt = performance.now(); this.state.busy = name; this.render(); console.info("browser.action.started", { action: name });
-    try { await operation(); this.state.error = ""; await this.manualRefresh(); console.info("browser.action.completed", { action: name, elapsedMs: Math.round(performance.now() - startedAt) }); }
-    catch (error) { this.fail(error, "action"); } finally { this.state.busy = ""; this.render(); }
+    const startedAt = performance.now(); const key = this.key; const sessionId = this.state.sessionId; const current = () => this.key === key && this.state.sessionId === sessionId; this.state.busy = name; this.render(); console.info("browser.action.started", { action: name });
+    try { await operation(); if (current()) { this.state.error = ""; await this.manualRefresh(); console.info("browser.action.completed", { action: name, elapsedMs: Math.round(performance.now() - startedAt) }); } }
+    catch (error) { if (current()) this.fail(error, "action"); else console.error("browser.action.stale_failed", { action: name, message: errorText(error) }); } finally { this.state.busy = ""; if (!this.disposed) this.render(); }
   }
   async chooseSession(id) {
     this.invalidateRefresh(); this.state.userSelected = true; this.state.sessionId = id; this.state.follow = true; await this.resetPages(); console.info("browser.session.selected", { source: "user" }); await this.manualRefresh();
@@ -150,8 +150,8 @@ class BrowserController {
     await this.action(action, () => this.host.request("xsec.browser.page.action", { browserSessionId: session.id, pageId: page.id, action }));
   }
   async closePage(id) {
-    const session = this.session(); if (!session?.live) return; const next = this.state.pageId === id ? pageAfterClose(this.state.pages, id) : null;
-    await this.action("close", async () => { await this.host.request("xsec.browser.page.close", { browserSessionId: session.id, pageId: id }); if (next) { this.state.follow = false; this.state.pageId = next; this.clearSurfaceError(); this.updateAddress(); } });
+    const session = this.session(); const key = this.key; if (!session?.live) return; const next = this.state.pageId === id ? pageAfterClose(this.state.pages, id) : null;
+    await this.action("close", async () => { await this.host.request("xsec.browser.page.close", { browserSessionId: session.id, pageId: id }); if (next && this.key === key && this.session()?.id === session.id && this.state.pageId === id) { this.state.follow = false; this.state.pageId = next; this.clearSurfaceError(); this.updateAddress(); } });
   }
   async closeSurface(clearState = true, invalidate = true) {
     const surface = this.surface; const subscription = this.subscription; if (invalidate) this.surfaceGeneration += 1; this.surface = undefined; this.subscription = undefined; this.frameSurfaceId = ""; this.clearSurfaceInput(); subscription?.dispose?.();
@@ -230,7 +230,7 @@ class BrowserController {
     const owners = this.state.groups.filter((group) => group.current_page_id === this.state.pageId).map((group) => group.owner === "parent" ? "主 Agent" : "子 Agent").join(" · "); this.controls.footer.replaceChildren(element("span", "", page ? `${displayUrl(page.url)} · ${page.id.slice(0, 12)}` : "未选择页面"), element("span", "", owners), element("span", "", `${VIEWPORT_WIDTH} × ${VIEWPORT_HEIGHT}`));
   }
   buildWorkspace() {
-    this.root.replaceChildren(element("style", "", css)); this.controls = workspaceControls(this); this.root.append(this.controls.app); window.addEventListener("keydown", this.onEscape); document.addEventListener("visibilitychange", this.onVisibilityChange); this.render();
+    this.root.replaceChildren(element("style", "", css)); this.controls = workspaceControls(this); this.root.append(this.controls.app); window.addEventListener("keydown", this.onEscape); window.addEventListener("blur", this.onWindowBlur); document.addEventListener("visibilitychange", this.onVisibilityChange); this.render();
   }
   buildSettings() {
     this.root.replaceChildren(element("style", "", css)); this.controls = settingsControls(this); this.root.append(this.controls.app); void this.loadSettings();
@@ -242,9 +242,9 @@ class BrowserController {
   }
   settingsMessage(message, failed) { this.controls.settingsStatus.textContent = message; this.controls.settingsStatus.classList.toggle("error", failed); }
   async saveSettings() {
-    if (!this.settingsReady) return; const button = this.controls.settingsSave; button.disabled = true; this.controls.settingsInput.disabled = true; this.settingsMessage("正在保存…", false); console.info("browser.settings.save.started");
-    try { const result = await this.host.request("xsec.browser.settings.set", { chromePath: this.controls.settingsInput.value.trim() }); this.controls.settingsInput.value = result.chromePath || ""; this.settingsMessage("浏览器路径已保存；新建浏览器会话时生效", false); console.info("browser.settings.save.completed"); }
-    catch (error) { this.settingsMessage(`保存浏览器路径失败：${errorText(error)}`, true); console.error("browser.settings.save.failed", { message: errorText(error) }); } finally { this.controls.settingsInput.disabled = false; button.disabled = false; }
+    if (!this.settingsReady) return; const revision = this.settingsRevision; const button = this.controls.settingsSave; button.disabled = true; this.controls.settingsInput.disabled = true; this.settingsMessage("正在保存…", false); console.info("browser.settings.save.started");
+    try { const result = await this.host.request("xsec.browser.settings.set", { chromePath: this.controls.settingsInput.value.trim() }); if (revision !== this.settingsRevision) return; this.controls.settingsInput.value = result.chromePath || ""; this.settingsMessage("浏览器路径已保存；新建浏览器会话时生效", false); console.info("browser.settings.save.completed"); }
+    catch (error) { if (revision !== this.settingsRevision) return; this.settingsMessage(`保存浏览器路径失败：${errorText(error)}`, true); console.error("browser.settings.save.failed", { message: errorText(error) }); } finally { if (revision === this.settingsRevision) { this.controls.settingsInput.disabled = false; button.disabled = false; } }
   }
 }
 function sessionOption(session, selected) {
@@ -280,10 +280,11 @@ function bindSurfaceInput(controller, canvas, keyboard) {
   canvas.onmousedown = (event) => { const mask = mouseButtonMask(event.button); if (!mask || controller.mouseButtons & mask) return; controller.mouseButtons = event.buttons; const point = controller.point(event); void controller.sendInput({ kind: "mouse", event_type: "down", ...point, button: mouseButton(event.button), buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
   const releaseMouse = async (event) => { const mask = mouseButtonMask(event.button); if (!mask || !(controller.mouseButtons & mask)) return; controller.mouseButtons = event.buttons; await controller.flushPendingMove(); const point = controller.point(event); await controller.sendInput({ kind: "mouse", event_type: "up", ...point, button: mouseButton(event.button), buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
   canvas.onmouseup = (event) => void releaseMouse(event); canvas.onpointercancel = (event) => { const buttons = controller.mouseButtons; controller.clearPendingMove(); if (!buttons) return; const point = controller.point(event); MOUSE_BUTTON_MASKS.forEach((mask, index) => { if (buttons & mask) void controller.sendInput({ kind: "mouse", event_type: "up", ...point, button: mouseButton(index), buttons: NO_MOUSE_BUTTONS, modifiers: eventModifiers(event) }); }); };
-  canvas.onpointermove = (event) => { const point = controller.point(event); controller.queueMove({ kind: "mouse", event_type: "move", ...point, button: "none", buttons: event.buttons, modifiers: eventModifiers(event) }); };
+  canvas.onpointermove = (event) => { if (event.buttons && event.buttons !== controller.mouseButtons) return; const point = controller.point(event); controller.queueMove({ kind: "mouse", event_type: "move", ...point, button: "none", buttons: event.buttons, modifiers: eventModifiers(event) }); };
   canvas.onwheel = (event) => { event.preventDefault(); const point = controller.point(event); controller.sendInput({ kind: "mouse", event_type: "wheel", ...point, button: "none", modifiers: eventModifiers(event), delta_x: event.deltaX, delta_y: event.deltaY }); };
-  keyboard.onkeydown = (event) => { if (event.isComposing || controller.composing || event.key === "Process") return; const paste = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v"; if (paste) { event.preventDefault(); return; } const printable = event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey; if (!printable) event.preventDefault(); controller.pressedKeys.add(event.code || event.key); void controller.sendInput({ kind: "key", event_type: "down", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }); };
+  keyboard.onkeydown = (event) => { if (event.isComposing || controller.composing || event.key === "Process") return; const paste = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v"; if (paste) return; const printable = event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey; if (!printable) event.preventDefault(); const key = event.code || event.key; const input = { kind: "key", event_type: "down", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }; controller.pressedKeys.set(key, input); void controller.sendInput(input); };
   keyboard.onkeyup = (event) => { const key = event.code || event.key; if (controller.composing || !controller.pressedKeys.delete(key)) return; void controller.sendInput({ kind: "key", event_type: "up", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }); };
+  keyboard.onblur = () => controller.releasePressedKeys();
   keyboard.oncompositionstart = () => { controller.composing = true; }; keyboard.oncompositionend = (event) => { controller.composing = false; controller.ignoredText = event.data; if (event.data) controller.sendInput({ kind: "insert_text", text: event.data }); event.target.value = ""; };
   keyboard.onpaste = (event) => { event.preventDefault(); const text = event.clipboardData.getData("text/plain"); if (text) controller.sendInput({ kind: "insert_text", text }); event.target.value = ""; };
   keyboard.oninput = (event) => { if (controller.composing) return; const text = event.target.value; event.target.value = ""; if (controller.ignoredText === text) { controller.ignoredText = undefined; return; } controller.ignoredText = undefined; if (text) controller.sendInput({ kind: "insert_text", text }); };
