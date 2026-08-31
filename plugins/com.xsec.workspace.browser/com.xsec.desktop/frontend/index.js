@@ -7,7 +7,8 @@ function displayUrl(url) { if (!url || url === "about:blank") return "新标签�
 function pageLabel(page) { return page.title?.trim() || displayUrl(page.url); }
 function normalizeUrl(value) {
   const source = value.trim(); if (!source) throw new Error("请输入地址");
-  const url = new URL(/^[a-z][a-z\d+.-]*:/i.test(source) ? source : `https://${source}`);
+  const hostPort = /^[^/:?#]+:\d+(?:[/?#]|$)/.test(source);
+  const url = new URL(hostPort || !/^[a-z][a-z\d+.-]*:/i.test(source) ? `https://${source}` : source);
   if (!/^https?:$/.test(url.protocol)) throw new Error("只允许 HTTP 或 HTTPS 地址"); return url.toString();
 }
 function packetHeader(raw) { const bytes = new Uint8Array(raw); return String.fromCharCode(...bytes.subarray(0, 4)); }
@@ -53,95 +54,91 @@ class BrowserController {
   constructor(host) {
     this.host = host; this.context = host.context || {}; this.key = workspaceKey(this.context);
     this.state = { sessions: [], sessionId: null, userSelected: false, pages: [], groups: [], pageId: null, pageUrl: null, follow: true, focus: false, address: "", error: "", surfaceError: "", busy: "", loading: true, pending: null, observed: null, surfaceState: "" };
-    this.timer = 0; this.revision = 0; this.refreshing = false; this.disposed = false; this.surface = undefined; this.subscription = undefined; this.moveTimer = 0; this.pendingMove = undefined; this.composing = false; this.ignoredText = undefined; this.nextFrameAckAt = 0;
+    this.timer = 0; this.revision = 0; this.refreshing = false; this.refreshQueued = false; this.disposed = false; this.surface = undefined; this.subscription = undefined; this.surfaceGeneration = 0; this.surfaceErrorKey = "";
+    this.moveTimer = 0; this.pendingMove = undefined; this.inputTail = Promise.resolve(); this.composing = false; this.ignoredText = undefined; this.pressedKeys = new Set(); this.pressedPointers = new Map(); this.nextFrameAckAt = 0; this.settingsReady = false; this.settingsRevision = 0;
     this.onEscape = (event) => { if (this.state.focus && event.key === "Escape") void this.setFocus(false).catch((error) => this.fail(error, "presentation")); };
+    this.onVisibilityChange = () => void this.handleVisibilityChange();
   }
   mount(root, context) {
     this.root = root; this.context = context || this.context;
     if (this.settingsPage()) { this.buildSettings(); return; }
-    this.buildWorkspace(); void this.refresh();
+    this.buildWorkspace(); console.debug("browser.workspace.mounted", { workspace: this.key }); void this.refresh();
   }
   async update(context) {
     const next = context || {}; const changed = workspaceKey(next) !== this.key;
-    this.context = next; this.key = workspaceKey(next);
-    if (this.settingsPage()) return;
-    if (changed) { this.state.userSelected = false; this.state.sessionId = null; this.state.follow = true; await this.resetPages(); }
+    this.context = next; this.key = workspaceKey(next); if (this.settingsPage()) return;
+    if (changed) { this.invalidateRefresh(); this.state.userSelected = false; this.state.sessionId = null; this.state.follow = true; await this.resetPages(); }
     if (this.visible()) await this.manualRefresh();
     else { if (this.state.focus) await this.setFocus(false); await this.closeSurface(); }
   }
   async dispose() {
-    this.disposed = true; this.clearTimer(); window.removeEventListener("keydown", this.onEscape);
-    if (this.moveTimer) window.clearTimeout(this.moveTimer);
-    if (this.state.focus) await this.setFocus(false);
-    await this.closeSurface(); this.root?.replaceChildren();
-    console.debug("browser.frontend.disposed");
+    this.disposed = true; this.invalidateRefresh(); this.clearTimer(); this.clearPendingMove(); window.removeEventListener("keydown", this.onEscape); document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    if (this.state.focus) await this.setFocus(false); await this.closeSurface(); this.root?.replaceChildren(); console.debug("browser.frontend.disposed");
   }
   settingsPage() { return this.context.kind === "settings-page"; }
   binding() { return this.context.workspace?.binding || {}; }
   visible() { return !this.disposed && this.context.visible !== false && document.visibilityState !== "hidden"; }
   session() { return this.state.sessions.find((item) => item.id === this.state.sessionId) || null; }
   page() { return this.state.pages.find((item) => item.id === this.state.pageId) || null; }
+  surfaceKey(sessionId, pageId) { return `${sessionId}:${pageId}`; }
   clearTimer() { if (this.timer) window.clearTimeout(this.timer); this.timer = 0; }
+  clearPendingMove() { if (this.moveTimer) window.clearTimeout(this.moveTimer); this.moveTimer = 0; this.pendingMove = undefined; this.pressedPointers.clear(); }
+  invalidateRefresh() { this.revision += 1; if (this.refreshing) this.refreshQueued = true; }
   schedule(delay) { this.clearTimer(); if (this.visible() && !this.state.error) this.timer = window.setTimeout(() => void this.refresh(), delay); }
+  clearSurfaceError() { this.surfaceErrorKey = ""; this.state.surfaceError = ""; if (["error", "closed"].includes(this.state.surfaceState)) this.state.surfaceState = ""; }
   async resetPages() {
-    Object.assign(this.state, { pages: [], groups: [], pageId: null, pageUrl: null, pending: null, observed: null, address: "", surfaceState: "", surfaceError: "" });
-    await this.closeSurface();
+    this.clearSurfaceError(); Object.assign(this.state, { pages: [], groups: [], pageId: null, pageUrl: null, pending: null, observed: null, address: "" }); await this.closeSurface();
+  }
+  async handleVisibilityChange() {
+    if (!this.visible()) { this.clearTimer(); this.clearPendingMove(); await this.closeSurface(); this.render(); console.debug("browser.workspace.hidden"); return; }
+    console.debug("browser.workspace.visible"); await this.manualRefresh();
   }
   async refresh() {
-    if (this.refreshing || !this.visible() || this.state.error) return;
-    const id = ++this.revision; this.refreshing = true;
+    if (this.refreshing) { this.refreshQueued = true; return; }
+    if (!this.visible() || this.state.error) return;
+    const id = ++this.revision; this.refreshing = true; this.refreshQueued = false;
     try {
-      const sessions = items(await this.host.request("xsec.browser.sessions.list", {}), "浏览器会话");
-      if (id !== this.revision) return;
+      const sessions = items(await this.host.request("xsec.browser.sessions.list", {}), "浏览器会话"); if (id !== this.revision) return;
       this.state.sessions = sessions; this.state.loading = false;
       const next = selectSession(sessions, this.state.sessionId, this.binding().assignmentId || this.binding().runId, this.state.userSelected);
       if (next !== this.state.sessionId) { this.state.sessionId = next; await this.resetPages(); }
       const session = this.session();
       if (!session?.live) { await this.resetPages(); this.render(); this.schedule(sessions.some((item) => item.live) ? LIVE_SESSION_POLL_MS : CLOSED_SESSION_POLL_MS); return; }
-      await this.refreshPages(session, id); this.state.error = ""; this.render(); this.schedule(PAGE_POLL_MS);
+      await this.refreshPages(session, id); if (id !== this.revision) return; this.state.error = ""; this.render(); this.schedule(PAGE_POLL_MS);
     } catch (error) { if (id === this.revision) { this.state.loading = false; this.fail(error, "sync"); } }
-    finally { this.refreshing = false; }
+    finally { this.refreshing = false; if (this.refreshQueued && this.visible()) { this.refreshQueued = false; void this.refresh(); } }
   }
   async refreshPages(session, revision) {
-    const snapshot = await this.host.request("xsec.browser.pages.list", { browserSessionId: session.id });
-    if (revision !== this.revision) return;
+    const snapshot = await this.host.request("xsec.browser.pages.list", { browserSessionId: session.id }); if (revision !== this.revision) return;
     if (!Array.isArray(snapshot?.pages) || !Array.isArray(snapshot.groups)) throw new Error("浏览器页面响应格式无效");
     const opened = this.state.observed && this.state.pageId ? snapshot.pages.find((page) => !this.state.observed.has(page.id) && page.opener_id === this.state.pageId)?.id : null;
     this.state.observed = new Set(snapshot.pages.map((page) => page.id)); this.state.pages = snapshot.pages; this.state.groups = snapshot.groups;
-    const pending = this.state.pending?.expiresAt > Date.now() ? this.state.pending.pageId : null;
-    if (!pending || snapshot.pages.some((page) => page.id === pending)) this.state.pending = null;
-    if (opened) this.state.follow = false;
-    const next = selectPage(snapshot.pages, snapshot.groups, this.state.pageId, this.state.follow, opened || pending);
-    if (next !== this.state.pageId) { this.state.pageId = next; this.updateAddress(); await this.ensureSurface(); }
-    else this.updateAddress();
+    const pending = this.state.pending?.expiresAt > Date.now() ? this.state.pending.pageId : null; if (!pending || snapshot.pages.some((page) => page.id === pending)) this.state.pending = null;
+    if (opened) this.state.follow = false; const next = selectPage(snapshot.pages, snapshot.groups, this.state.pageId, this.state.follow, opened || pending);
+    if (next !== this.state.pageId) { this.state.pageId = next; this.clearSurfaceError(); } this.updateAddress(); await this.ensureSurface();
   }
   updateAddress() {
-    const page = this.page(); const url = page?.url || null;
-    if (url === this.state.pageUrl) return;
+    const page = this.page(); const url = page?.url || null; if (url === this.state.pageUrl) return;
     this.state.pageUrl = url; this.state.address = url && url !== "about:blank" ? url : "";
   }
-  async manualRefresh() { this.state.error = ""; this.clearTimer(); await this.refresh(); }
-  fail(error, stage) { console.error(`browser.${stage}.failed`, errorText(error)); this.state.error = errorText(error); this.render(); }
+  async manualRefresh() {
+    this.state.error = ""; this.clearTimer(); if (this.refreshing) { this.invalidateRefresh(); return; } await this.refresh();
+  }
+  fail(error, stage) { console.error(`browser.${stage}.failed`, { message: errorText(error) }); this.state.error = errorText(error); this.render(); }
   async action(name, operation) {
     const startedAt = performance.now(); this.state.busy = name; this.render(); console.info("browser.action.started", { action: name });
     try { await operation(); this.state.error = ""; await this.manualRefresh(); console.info("browser.action.completed", { action: name, elapsedMs: Math.round(performance.now() - startedAt) }); }
-    catch (error) { this.fail(error, "action"); }
-    finally { this.state.busy = ""; this.render(); }
+    catch (error) { this.fail(error, "action"); } finally { this.state.busy = ""; this.render(); }
   }
   async chooseSession(id) {
-    this.state.userSelected = true; this.state.sessionId = id; this.state.follow = true; await this.resetPages();
-    console.info("browser.session.selected", { source: "user" }); await this.manualRefresh();
+    this.invalidateRefresh(); this.state.userSelected = true; this.state.sessionId = id; this.state.follow = true; await this.resetPages(); console.info("browser.session.selected", { source: "user" }); await this.manualRefresh();
   }
   async choosePage(id) {
-    this.state.pending = null; this.state.follow = false; this.state.pageId = id; this.updateAddress();
-    console.info("browser.page.selected", { source: "user" }); await this.ensureSurface(); this.render();
+    this.state.pending = null; this.state.follow = false; this.state.pageId = id; this.clearSurfaceError(); this.updateAddress(); console.info("browser.page.selected", { source: "user" }); await this.ensureSurface(); this.render();
   }
   async createPage() {
     const session = this.session(); if (!session?.live) return;
-    await this.action("new", async () => {
-      const result = await this.host.request("xsec.browser.page.create", { browserSessionId: session.id });
-      this.state.pending = { pageId: result.page_id, expiresAt: Date.now() + NEW_PAGE_GRACE_MS }; this.state.follow = false; this.state.pageId = result.page_id;
-    });
+    await this.action("new", async () => { const result = await this.host.request("xsec.browser.page.create", { browserSessionId: session.id }); this.state.pending = { pageId: result.page_id, expiresAt: Date.now() + NEW_PAGE_GRACE_MS }; this.state.follow = false; this.state.pageId = result.page_id; this.clearSurfaceError(); });
   }
   async navigate() {
     const session = this.session(); const page = this.page(); if (!session?.live || !page) return;
@@ -152,103 +149,97 @@ class BrowserController {
     await this.action(action, () => this.host.request("xsec.browser.page.action", { browserSessionId: session.id, pageId: page.id, action }));
   }
   async closePage(id) {
-    const session = this.session(); if (!session?.live) return;
-    const next = this.state.pageId === id ? pageAfterClose(this.state.pages, id) : null;
-    await this.action("close", async () => {
-      await this.host.request("xsec.browser.page.close", { browserSessionId: session.id, pageId: id });
-      if (next) { this.state.follow = false; this.state.pageId = next; this.updateAddress(); }
-    });
+    const session = this.session(); if (!session?.live) return; const next = this.state.pageId === id ? pageAfterClose(this.state.pages, id) : null;
+    await this.action("close", async () => { await this.host.request("xsec.browser.page.close", { browserSessionId: session.id, pageId: id }); if (next) { this.state.follow = false; this.state.pageId = next; this.clearSurfaceError(); this.updateAddress(); } });
   }
-  async closeSurface(clearState = true) {
-    this.subscription?.dispose?.(); this.subscription = undefined;
-    const surface = this.surface; this.surface = undefined;
-    if (clearState) this.state.surfaceState = "";
-    if (surface) await this.host.request("xsec.browser.surface.close", { surfaceId: surface.id });
+  async closeSurface(clearState = true, invalidate = true) {
+    const surface = this.surface; const subscription = this.subscription; if (invalidate) this.surfaceGeneration += 1; this.surface = undefined; this.subscription = undefined; this.clearPendingMove(); subscription?.dispose?.();
+    if (clearState) this.state.surfaceState = ""; if (surface) { console.debug("browser.surface.close.started", { pageId: surface.pageId }); await this.host.request("xsec.browser.surface.close", { surfaceId: surface.id }); }
   }
+  surfaceRequestCurrent(generation, sessionId, pageId) { return generation === this.surfaceGeneration && this.visible() && this.session()?.id === sessionId && this.page()?.id === pageId; }
   async ensureSurface() {
-    const session = this.session(); const page = this.page();
-    if (!this.visible() || !session?.live || !page) { await this.closeSurface(); return; }
-    if (this.surface?.pageId === page.id && this.surface.sessionId === session.id) return;
-    await this.closeSurface(); this.state.surfaceState = "connecting"; this.state.surfaceError = ""; this.render();
-    const result = await this.host.request("xsec.browser.surface.open", { browserSessionId: session.id, pageId: page.id, viewportWidth: VIEWPORT_WIDTH, viewportHeight: VIEWPORT_HEIGHT });
-    this.surface = { id: result.surfaceId, stream: result.stream, pageId: page.id, sessionId: session.id }; this.nextFrameAckAt = 0;
-    this.subscription = this.host.onData(result.stream, (raw) => void this.present(raw, result.surfaceId).catch((error) => void this.failSurface(error)));
-    await this.host.request("xsec.browser.surface.ready", { surfaceId: result.surfaceId });
+    const session = this.session(); const page = this.page(); if (!this.visible() || !session?.live || !page) { await this.closeSurface(); return; }
+    const key = this.surfaceKey(session.id, page.id); if (this.surface?.pageId === page.id && this.surface.sessionId === session.id) return; if (this.surfaceErrorKey === key) return;
+    const generation = ++this.surfaceGeneration; await this.closeSurface(true, false); if (generation !== this.surfaceGeneration) return; this.state.surfaceState = "connecting"; this.state.surfaceError = ""; this.render(); console.info("browser.surface.open.started", { pageId: page.id });
+    try {
+      const result = await this.host.request("xsec.browser.surface.open", { browserSessionId: session.id, pageId: page.id, viewportWidth: VIEWPORT_WIDTH, viewportHeight: VIEWPORT_HEIGHT });
+      if (!this.surfaceRequestCurrent(generation, session.id, page.id)) { await this.host.request("xsec.browser.surface.close", { surfaceId: result.surfaceId }); return; }
+      this.surface = { id: result.surfaceId, stream: result.stream, pageId: page.id, sessionId: session.id }; this.nextFrameAckAt = 0;
+      this.subscription = this.host.onData(result.stream, (raw) => void this.present(raw, result.surfaceId).catch((error) => void this.failSurface(error, result.surfaceId)));
+      await this.host.request("xsec.browser.surface.ready", { surfaceId: result.surfaceId });
+      if (!this.surfaceRequestCurrent(generation, session.id, page.id) || this.surface?.id !== result.surfaceId) { await this.host.request("xsec.browser.surface.close", { surfaceId: result.surfaceId }); return; }
+      console.info("browser.surface.open.completed", { pageId: page.id });
+    } catch (error) { if (generation !== this.surfaceGeneration) return; await this.failSurface(error, undefined, generation); }
   }
-  async retrySurface() { this.state.surfaceError = ""; await this.closeSurface(); await this.ensureSurface(); }
+  async retrySurface() { this.clearSurfaceError(); await this.closeSurface(); await this.ensureSurface(); }
   async acknowledgeFrame(surfaceId) {
     const delay = Math.max(0, this.nextFrameAckAt - performance.now()); if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
     if (this.surface?.id !== surfaceId) return; this.nextFrameAckAt = performance.now() + FRAME_ACK_INTERVAL_MS; await this.host.request("xsec.browser.surface.acknowledge", { surfaceId });
   }
   async present(raw, surfaceId) {
-    if (!this.controls || this.surface?.id !== surfaceId) return;
-    const event = parseEvent(raw);
-    if (event) {
-      if (event.kind === "started") this.state.surfaceState = "live";
-      if (event.kind === "closed") { this.state.surfaceState = "closed"; this.surface = undefined; this.subscription?.dispose?.(); this.subscription = undefined; }
-      if (event.kind === "error") throw new Error(event.message || "真实浏览器画面不可用");
-      this.render(); return;
-    }
-    const frame = parseFrame(raw); if (!frame) throw new Error("未知的浏览器画面数据");
+    if (!this.controls || this.surface?.id !== surfaceId) return; const event = parseEvent(raw);
+    if (event) { await this.presentEvent(event, surfaceId); return; }
+    const frame = parseFrame(raw); if (!frame) throw new Error("未知的浏览器画面数据"); await this.presentFrame(frame, surfaceId);
+  }
+  async presentEvent(event, surfaceId) {
+    if (event.kind === "error") throw new Error(event.message || "真实浏览器画面不可用");
+    if (event.kind === "closed") { this.subscription?.dispose?.(); this.subscription = undefined; this.surface = undefined; this.surfaceErrorKey = this.surfaceKey(this.state.sessionId, this.state.pageId); this.state.surfaceState = "closed"; this.render(); return; }
+    if (this.state.surfaceState !== "live") { this.state.surfaceState = "live"; this.render(); }
+  }
+  async presentFrame(frame, surfaceId) {
     try {
-      const image = await createImageBitmap(new Blob([frame.jpeg], { type: "image/jpeg" }));
-      if (this.surface?.id !== surfaceId) { image.close(); return; }
-      this.controls.canvas.width = frame.width; this.controls.canvas.height = frame.height;
-      this.controls.canvas.getContext("2d", { alpha: false })?.drawImage(image, 0, 0, frame.width, frame.height); image.close(); this.state.surfaceState = "live";
+      const image = await createImageBitmap(new Blob([frame.jpeg], { type: "image/jpeg" })); if (this.surface?.id !== surfaceId) { image.close(); return; }
+      this.controls.canvas.width = frame.width; this.controls.canvas.height = frame.height; this.controls.canvas.getContext("2d", { alpha: false })?.drawImage(image, 0, 0, frame.width, frame.height); image.close();
+      if (this.state.surfaceState !== "live") { this.state.surfaceState = "live"; this.render(); }
     } finally { await this.acknowledgeFrame(surfaceId); }
-    this.render();
   }
-  async failSurface(error) {
-    console.error("browser.surface.failed", errorText(error)); this.state.surfaceState = "error"; this.state.surfaceError = errorText(error); this.render();
-    await this.closeSurface(false);
+  async failSurface(error, surfaceId, generation) {
+    if (generation !== undefined && generation !== this.surfaceGeneration) return; if (surfaceId && this.surface?.id !== surfaceId) return;
+    this.surfaceErrorKey = this.surfaceKey(this.state.sessionId, this.state.pageId); this.state.surfaceState = "error"; this.state.surfaceError = errorText(error); console.error("browser.surface.failed", { message: this.state.surfaceError }); this.render();
+    if (this.surface) await this.closeSurface(false);
   }
-  async setFocus(focus) {
-    await this.host.request("xsec.browser.presentation.set", { focus }); this.state.focus = focus; this.render();
-  }
+  async setFocus(focus) { await this.host.request("xsec.browser.presentation.set", { focus }); this.state.focus = focus; this.render(); }
   sendInput(input) {
-    if (!this.surface) return;
-    void this.host.request("xsec.browser.surface.input", { surfaceId: this.surface.id, input }).catch((error) => void this.failSurface(error));
+    const surface = this.surface; if (!surface) return Promise.resolve();
+    const send = async () => { if (this.surface?.id !== surface.id) return; try { await this.host.request("xsec.browser.surface.input", { surfaceId: surface.id, input }); } catch (error) { await this.failSurface(error, surface.id); } };
+    this.inputTail = this.inputTail.then(send, send); return this.inputTail;
   }
   point(event) {
     const rect = this.controls.canvas.getBoundingClientRect(); const width = this.controls.canvas.width || VIEWPORT_WIDTH; const height = this.controls.canvas.height || VIEWPORT_HEIGHT;
     return { x: Math.max(0, Math.min(width, ((event.clientX - rect.left) / rect.width) * width)), y: Math.max(0, Math.min(height, ((event.clientY - rect.top) / rect.height) * height)) };
   }
   queueMove(input) {
-    this.pendingMove = input; if (this.moveTimer) return;
-    this.moveTimer = window.setTimeout(() => { this.moveTimer = 0; if (this.pendingMove) this.sendInput(this.pendingMove); this.pendingMove = undefined; }, POINTER_MOVE_MS);
+    this.pendingMove = input; if (this.moveTimer) return; this.moveTimer = window.setTimeout(() => void this.flushPendingMove(), POINTER_MOVE_MS);
+  }
+  async flushPendingMove() {
+    if (this.moveTimer) window.clearTimeout(this.moveTimer); this.moveTimer = 0; const input = this.pendingMove; this.pendingMove = undefined; if (input) await this.sendInput(input);
   }
   render() {
-    if (!this.controls) return;
-    const session = this.session(); const page = this.page(); const live = Boolean(session?.live);
-    this.controls.app.classList.toggle("focus", this.state.focus); this.controls.select.replaceChildren(...this.state.sessions.map((item) => sessionOption(item, item.id === this.state.sessionId)));
-    this.controls.tabs.replaceChildren(...this.state.pages.map((item) => pageTab(this, item)), this.controls.newTab);
-    this.controls.sessionDot.classList.toggle("live", live); this.controls.sessionText.textContent = live ? "真实 Chrome 已连接" : "浏览器已离线";
-    this.controls.address.value = this.state.address; this.controls.follow.classList.toggle("active", this.state.follow); this.controls.focus.classList.toggle("active", this.state.focus);
-    this.controls.error.textContent = this.state.error; this.controls.error.hidden = !this.state.error; this.controls.canvas.hidden = !live || !page;
+    if (!this.controls) return; const session = this.session(); const page = this.page(); const live = Boolean(session?.live);
+    this.controls.app.classList.toggle("focus", this.state.focus); this.controls.select.replaceChildren(...this.state.sessions.map((item) => sessionOption(item, item.id === this.state.sessionId))); this.controls.tabs.replaceChildren(...this.state.pages.map((item) => pageTab(this, item)), this.controls.newTab);
+    this.controls.sessionDot.classList.toggle("live", live); this.controls.sessionText.textContent = live ? "真实 Chrome 已连接" : "浏览器已离线"; if (document.activeElement !== this.controls.address) this.controls.address.value = this.state.address;
+    this.controls.follow.classList.toggle("active", this.state.follow); this.controls.focus.classList.toggle("active", this.state.focus); this.controls.error.textContent = this.state.error; this.controls.error.hidden = !this.state.error; this.controls.canvas.hidden = !live || !page;
     this.controls.empty.hidden = Boolean(live && page); this.controls.empty.textContent = this.state.loading ? "正在读取浏览器会话…" : !this.state.sessions.length ? "当前任务还没有浏览器会话。MCP 创建浏览器后，这里会自动映射真实页面。" : live ? "浏览器中没有页面" : "该浏览器会话已经结束";
-    this.controls.surfaceStatus.textContent = this.state.surfaceError || surfaceStatus(this.state.surfaceState); this.controls.surfaceStatus.hidden = !this.controls.surfaceStatus.textContent;
-    this.controls.surfaceRetry.hidden = !this.state.surfaceError && this.state.surfaceState !== "closed";
+    this.controls.surfaceStatus.textContent = this.state.surfaceError || surfaceStatus(this.state.surfaceState); this.controls.surfaceStatus.hidden = !this.controls.surfaceStatus.textContent; this.controls.surfaceRetry.hidden = !this.state.surfaceError && this.state.surfaceState !== "closed";
     this.controls.newTab.disabled = !live || Boolean(this.state.busy); this.controls.actions.forEach((button) => { button.disabled = !live || !page || Boolean(this.state.busy); });
-    const owners = this.state.groups.filter((group) => group.current_page_id === this.state.pageId).map((group) => group.owner === "parent" ? "主 Agent" : "子 Agent").join(" · ");
-    this.controls.footer.replaceChildren(element("span", "", page ? `${displayUrl(page.url)} · ${page.id.slice(0, 12)}` : "未选择页面"), element("span", "", owners), element("span", "", `${VIEWPORT_WIDTH} × ${VIEWPORT_HEIGHT}`));
+    const owners = this.state.groups.filter((group) => group.current_page_id === this.state.pageId).map((group) => group.owner === "parent" ? "主 Agent" : "子 Agent").join(" · "); this.controls.footer.replaceChildren(element("span", "", page ? `${displayUrl(page.url)} · ${page.id.slice(0, 12)}` : "未选择页面"), element("span", "", owners), element("span", "", `${VIEWPORT_WIDTH} × ${VIEWPORT_HEIGHT}`));
   }
   buildWorkspace() {
-    this.root.replaceChildren(element("style", "", css)); this.controls = workspaceControls(this); this.root.append(this.controls.app);
-    window.addEventListener("keydown", this.onEscape); this.render();
+    this.root.replaceChildren(element("style", "", css)); this.controls = workspaceControls(this); this.root.append(this.controls.app); window.addEventListener("keydown", this.onEscape); document.addEventListener("visibilitychange", this.onVisibilityChange); this.render();
   }
   buildSettings() {
     this.root.replaceChildren(element("style", "", css)); this.controls = settingsControls(this); this.root.append(this.controls.app); void this.loadSettings();
   }
   async loadSettings() {
-    try { const result = await this.host.request("xsec.browser.settings.get", {}); this.controls.settingsInput.value = result.chromePath || ""; }
-    catch (error) { this.settingsMessage(`读取浏览器路径失败：${errorText(error)}`, true); console.error("browser.settings.read.failed"); }
+    const revision = ++this.settingsRevision; this.settingsReady = false; this.controls.settingsInput.disabled = true; this.controls.settingsSave.disabled = true; this.controls.settingsRetry.hidden = true; this.settingsMessage("正在读取浏览器路径…", false);
+    try { const result = await this.host.request("xsec.browser.settings.get", {}); if (revision !== this.settingsRevision) return; this.controls.settingsInput.value = result.chromePath || ""; this.settingsReady = true; this.controls.settingsInput.disabled = false; this.controls.settingsSave.disabled = false; this.settingsMessage("", false); console.info("browser.settings.read.completed"); }
+    catch (error) { if (revision !== this.settingsRevision) return; this.settingsMessage(`读取浏览器路径失败：${errorText(error)}`, true); this.controls.settingsRetry.hidden = false; console.error("browser.settings.read.failed", { message: errorText(error) }); }
   }
   settingsMessage(message, failed) { this.controls.settingsStatus.textContent = message; this.controls.settingsStatus.classList.toggle("error", failed); }
   async saveSettings() {
-    const button = this.controls.settingsSave; button.disabled = true; this.settingsMessage("正在保存…", false); console.info("browser.settings.save.started");
+    if (!this.settingsReady) return; const button = this.controls.settingsSave; button.disabled = true; this.controls.settingsInput.disabled = true; this.settingsMessage("正在保存…", false); console.info("browser.settings.save.started");
     try { const result = await this.host.request("xsec.browser.settings.set", { chromePath: this.controls.settingsInput.value.trim() }); this.controls.settingsInput.value = result.chromePath || ""; this.settingsMessage("浏览器路径已保存；新建浏览器会话时生效", false); console.info("browser.settings.save.completed"); }
-    catch (error) { this.settingsMessage(`保存浏览器路径失败：${errorText(error)}`, true); console.error("browser.settings.save.failed"); }
-    finally { button.disabled = false; }
+    catch (error) { this.settingsMessage(`保存浏览器路径失败：${errorText(error)}`, true); console.error("browser.settings.save.failed", { message: errorText(error) }); } finally { this.controls.settingsInput.disabled = false; button.disabled = false; }
   }
 }
 function sessionOption(session, selected) {
@@ -279,18 +270,21 @@ function workspaceControls(controller) {
   return { app, select, sessionDot, sessionText, follow, focus, tabs, newTab, address, error, canvas, surfaceStatus, surfaceRetry, empty, footer, actions: [back, forward, reload, stop] };
 }
 function bindSurfaceInput(controller, canvas, keyboard) {
-  canvas.onpointerdown = (event) => { canvas.setPointerCapture(event.pointerId); keyboard.focus({ preventScroll: true }); const point = controller.point(event); controller.sendInput({ kind: "mouse", event_type: "down", ...point, button: mouseButton(event.button), buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
-  canvas.onpointerup = (event) => { const point = controller.point(event); controller.sendInput({ kind: "mouse", event_type: "up", ...point, button: mouseButton(event.button), buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
+  canvas.oncontextmenu = (event) => event.preventDefault();
+  canvas.onpointerdown = (event) => { const button = mouseButton(event.button); controller.pressedPointers.set(event.pointerId, button); canvas.setPointerCapture(event.pointerId); keyboard.focus({ preventScroll: true }); const point = controller.point(event); void controller.sendInput({ kind: "mouse", event_type: "down", ...point, button, buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
+  const releasePointer = async (event) => { const button = controller.pressedPointers.get(event.pointerId) || mouseButton(event.button); controller.pressedPointers.delete(event.pointerId); await controller.flushPendingMove(); const point = controller.point(event); await controller.sendInput({ kind: "mouse", event_type: "up", ...point, button, buttons: 0, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
+  canvas.onpointerup = (event) => void releasePointer(event);
+  canvas.onpointercancel = (event) => void releasePointer(event);
   canvas.onpointermove = (event) => { const point = controller.point(event); controller.queueMove({ kind: "mouse", event_type: "move", ...point, button: "none", buttons: event.buttons, modifiers: eventModifiers(event) }); };
   canvas.onwheel = (event) => { event.preventDefault(); const point = controller.point(event); controller.sendInput({ kind: "mouse", event_type: "wheel", ...point, button: "none", modifiers: eventModifiers(event), delta_x: event.deltaX, delta_y: event.deltaY }); };
-  keyboard.onkeydown = (event) => { if (event.isComposing || controller.composing) return; const paste = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v"; if (paste || event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey) return; event.preventDefault(); controller.sendInput({ kind: "key", event_type: "down", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }); };
-  keyboard.onkeyup = (event) => { if (!controller.composing) controller.sendInput({ kind: "key", event_type: "up", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }); };
+  keyboard.onkeydown = (event) => { if (event.isComposing || controller.composing || event.key === "Process") return; const paste = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v"; const printable = event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey; if (!printable && !paste) event.preventDefault(); controller.pressedKeys.add(event.code || event.key); void controller.sendInput({ kind: "key", event_type: "down", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }); };
+  keyboard.onkeyup = (event) => { const key = event.code || event.key; if (controller.composing || !controller.pressedKeys.delete(key)) return; void controller.sendInput({ kind: "key", event_type: "up", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }); };
   keyboard.oncompositionstart = () => { controller.composing = true; }; keyboard.oncompositionend = (event) => { controller.composing = false; controller.ignoredText = event.data; if (event.data) controller.sendInput({ kind: "insert_text", text: event.data }); event.target.value = ""; };
   keyboard.onpaste = (event) => { event.preventDefault(); const text = event.clipboardData.getData("text/plain"); if (text) controller.sendInput({ kind: "insert_text", text }); event.target.value = ""; };
   keyboard.oninput = (event) => { if (controller.composing) return; const text = event.target.value; event.target.value = ""; if (controller.ignoredText === text) { controller.ignoredText = undefined; return; } controller.ignoredText = undefined; if (text) controller.sendInput({ kind: "insert_text", text }); };
 }
-function settingsControls(controller) { const app = element("main", "settings"); const title = element("h1", "", "自定义浏览器路径"); const description = element("p", "", "仅在自动发现的浏览器不适用时填写可执行文件路径；留空会使用系统默认发现结果。"); const form = element("div", "settings-form"); const settingsInput = element("input"); const settingsSave = element("button", "", "保存"); const settingsStatus = element("div", "settings-status");
-  settingsInput.setAttribute("aria-label", "自定义 Chrome 路径"); settingsInput.placeholder = navigator.userAgent.includes("Windows") ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"; settingsSave.onclick = () => void controller.saveSettings(); form.append(settingsInput, settingsSave); app.append(title, description, form, settingsStatus); return { app, settingsInput, settingsSave, settingsStatus };
+function settingsControls(controller) { const app = element("main", "settings"); const title = element("h1", "", "自定义浏览器路径"); const description = element("p", "", "仅在自动发现的浏览器不适用时填写可执行文件路径；留空会使用系统默认发现结果。"); const form = element("div", "settings-form"); const settingsInput = element("input"); const settingsSave = element("button", "", "保存"); const settingsRetry = element("button", "", "重新读取"); const settingsStatus = element("div", "settings-status");
+  settingsInput.setAttribute("aria-label", "自定义 Chrome 路径"); settingsInput.placeholder = navigator.userAgent.includes("Windows") ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"; settingsSave.type = "button"; settingsSave.onclick = () => void controller.saveSettings(); settingsRetry.type = "button"; settingsRetry.hidden = true; settingsRetry.onclick = () => void controller.loadSettings(); form.append(settingsInput, settingsSave, settingsRetry); app.append(title, description, form, settingsStatus); return { app, settingsInput, settingsSave, settingsRetry, settingsStatus };
 }
 export function activate(host) {
   console.debug("browser.frontend.activated", { apiVersion: host.apiVersion }); const controller = new BrowserController(host); return {
