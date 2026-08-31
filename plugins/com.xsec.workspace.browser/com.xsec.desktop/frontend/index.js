@@ -127,8 +127,8 @@ class BrowserController {
   }
   fail(error, stage) { console.error(`browser.${stage}.failed`, { message: errorText(error) }); this.state.error = errorText(error); this.render(); }
   async action(name, operation) {
-    const startedAt = performance.now(); const key = this.key; const sessionId = this.state.sessionId; const current = () => this.key === key && this.state.sessionId === sessionId; this.state.busy = name; this.render(); console.info("browser.action.started", { action: name });
-    try { await operation(); if (current()) { this.state.error = ""; await this.manualRefresh(); console.info("browser.action.completed", { action: name, elapsedMs: Math.round(performance.now() - startedAt) }); } }
+    const startedAt = performance.now(); const scope = { key: this.key, sessionId: this.state.sessionId, pageId: this.state.pageId }; const current = () => this.key === scope.key && this.state.sessionId === scope.sessionId && this.state.pageId === scope.pageId; this.state.busy = name; this.render(); console.info("browser.action.started", { action: name });
+    try { await operation(scope); if (current()) { this.state.error = ""; await this.manualRefresh(); console.info("browser.action.completed", { action: name, elapsedMs: Math.round(performance.now() - startedAt) }); } }
     catch (error) { if (current()) this.fail(error, "action"); else console.error("browser.action.stale_failed", { action: name, message: errorText(error) }); } finally { this.state.busy = ""; if (!this.disposed) this.render(); }
   }
   async chooseSession(id) {
@@ -139,11 +139,11 @@ class BrowserController {
   }
   async createPage() {
     const session = this.session(); const key = this.key; if (!session?.live) return;
-    await this.action("new", async () => { const result = await this.host.request("xsec.browser.page.create", { browserSessionId: session.id }); if (this.key !== key || this.session()?.id !== session.id) return; this.state.pending = { pageId: result.page_id, expiresAt: Date.now() + NEW_PAGE_GRACE_MS }; this.state.follow = false; this.state.pageId = result.page_id; this.clearSurfaceError(); });
+    await this.action("new", async (scope) => { const result = await this.host.request("xsec.browser.page.create", { browserSessionId: session.id }); if (this.key !== key || this.session()?.id !== session.id || this.state.pageId !== scope.pageId) return; this.state.pending = { pageId: result.page_id, expiresAt: Date.now() + NEW_PAGE_GRACE_MS }; this.state.follow = false; this.state.pageId = result.page_id; scope.pageId = result.page_id; this.clearSurfaceError(); });
   }
   async navigate() {
     const session = this.session(); const page = this.page(); if (!session?.live || !page) return;
-    const url = normalizeUrl(this.state.address); await this.action("navigate", () => this.host.request("xsec.browser.page.navigate", { browserSessionId: session.id, pageId: page.id, url }));
+    const address = this.state.address; await this.action("navigate", () => this.host.request("xsec.browser.page.navigate", { browserSessionId: session.id, pageId: page.id, url: normalizeUrl(address) }));
   }
   async pageAction(action) {
     const session = this.session(); const page = this.page(); if (!session?.live || !page) return;
@@ -151,7 +151,7 @@ class BrowserController {
   }
   async closePage(id) {
     const session = this.session(); const key = this.key; if (!session?.live) return; const next = this.state.pageId === id ? pageAfterClose(this.state.pages, id) : null;
-    await this.action("close", async () => { await this.host.request("xsec.browser.page.close", { browserSessionId: session.id, pageId: id }); if (next && this.key === key && this.session()?.id === session.id && this.state.pageId === id) { this.state.follow = false; this.state.pageId = next; this.clearSurfaceError(); this.updateAddress(); } });
+    await this.action("close", async (scope) => { await this.host.request("xsec.browser.page.close", { browserSessionId: session.id, pageId: id }); if (next && this.key === key && this.session()?.id === session.id && this.state.pageId === id) { this.state.follow = false; this.state.pageId = next; scope.pageId = next; this.clearSurfaceError(); this.updateAddress(); } });
   }
   async closeSurface(clearState = true, invalidate = true) {
     const surface = this.surface; const subscription = this.subscription; if (invalidate) this.surfaceGeneration += 1; this.surface = undefined; this.subscription = undefined; this.frameSurfaceId = ""; this.clearSurfaceInput(); subscription?.dispose?.();
@@ -276,8 +276,8 @@ function workspaceControls(controller) {
 }
 function bindSurfaceInput(controller, canvas, keyboard) {
   canvas.oncontextmenu = (event) => event.preventDefault();
-  canvas.onpointerdown = (event) => { controller.mouseButtons = event.buttons; canvas.setPointerCapture(event.pointerId); keyboard.focus({ preventScroll: true }); const point = controller.point(event); void controller.sendInput({ kind: "mouse", event_type: "down", ...point, button: mouseButton(event.button), buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
-  canvas.onmousedown = (event) => { const mask = mouseButtonMask(event.button); if (!mask || controller.mouseButtons & mask) return; controller.mouseButtons = event.buttons; const point = controller.point(event); void controller.sendInput({ kind: "mouse", event_type: "down", ...point, button: mouseButton(event.button), buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
+  const pressMouse = async (event, capture) => { const mask = mouseButtonMask(event.button); if (!mask || controller.mouseButtons & mask) return; controller.mouseButtons = event.buttons; if (capture) canvas.setPointerCapture(event.pointerId); keyboard.focus({ preventScroll: true }); await controller.flushPendingMove(); const point = controller.point(event); await controller.sendInput({ kind: "mouse", event_type: "down", ...point, button: mouseButton(event.button), buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
+  canvas.onpointerdown = (event) => void pressMouse(event, true); canvas.onmousedown = (event) => void pressMouse(event, false);
   const releaseMouse = async (event) => { const mask = mouseButtonMask(event.button); if (!mask || !(controller.mouseButtons & mask)) return; controller.mouseButtons = event.buttons; await controller.flushPendingMove(); const point = controller.point(event); await controller.sendInput({ kind: "mouse", event_type: "up", ...point, button: mouseButton(event.button), buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }); };
   canvas.onmouseup = (event) => void releaseMouse(event); canvas.onpointercancel = (event) => { const buttons = controller.mouseButtons; controller.clearPendingMove(); if (!buttons) return; const point = controller.point(event); MOUSE_BUTTON_MASKS.forEach((mask, index) => { if (buttons & mask) void controller.sendInput({ kind: "mouse", event_type: "up", ...point, button: mouseButton(index), buttons: NO_MOUSE_BUTTONS, modifiers: eventModifiers(event) }); }); };
   canvas.onpointermove = (event) => { if (event.buttons && event.buttons !== controller.mouseButtons) return; const point = controller.point(event); controller.queueMove({ kind: "mouse", event_type: "move", ...point, button: "none", buttons: event.buttons, modifiers: eventModifiers(event) }); };
