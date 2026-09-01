@@ -127,7 +127,8 @@ class BrowserController {
   }
   updateAddress(force = false) {
     const page = this.page(); const url = page?.url || null; if (url === this.state.pageUrl && !force) return;
-    this.state.pageUrl = url; const editingCurrentPage = document.activeElement === this.controls?.address && this.addressEditPageId === this.state.pageId; if (!editingCurrentPage) this.state.address = url && url !== "about:blank" ? url : "";
+    this.state.pageUrl = url; const editing = document.activeElement === this.controls?.address; const editingCurrentPage = editing && this.addressEditPageId === this.state.pageId;
+    if (!editingCurrentPage) { this.state.address = url && url !== "about:blank" ? url : ""; if (editing) this.addressEditPageId = this.state.pageId; }
   }
   async manualRefresh() {
     this.state.error = ""; this.clearTimer(); if (this.refreshing) { this.invalidateRefresh(); await this.refreshLoopPromise; return; } await this.refresh();
@@ -176,7 +177,14 @@ class BrowserController {
       this.surface = { id: result.surfaceId, stream: result.stream, pageId: page.id, sessionId: session.id }; this.nextFrameAckAt = 0;
       this.subscription = this.host.onData(result.stream, (raw) => { this.presentationTail = this.presentationTail.then(() => this.present(raw, result.surfaceId), () => this.present(raw, result.surfaceId)).catch((error) => this.failSurface(error, result.surfaceId)); });
       await this.host.request("xsec.browser.surface.ready", { surfaceId: result.surfaceId });
-      if (!this.surfaceRequestCurrent(generation, session.id, page.id) || this.surface?.id !== result.surfaceId) { const stale = this.surface?.id === result.surfaceId ? this.surface : undefined; if (stale) { this.surface = undefined; this.subscription?.dispose?.(); this.subscription = undefined; this.frameSurfaceId = ""; this.clearSurfaceInput(); } await this.closeNativeSurface(stale || { id: result.surfaceId, pageId: page.id }); return; }
+      if (!this.surfaceRequestCurrent(generation, session.id, page.id) || this.surface?.id !== result.surfaceId) {
+        const stale = this.surface?.id === result.surfaceId ? this.surface : undefined;
+        if (stale) { this.surface = undefined; this.subscription?.dispose?.(); this.subscription = undefined; this.frameSurfaceId = ""; this.clearSurfaceInput(); }
+        const teardown = this.surfaceTeardownPromise;
+        if (teardown) await teardown;
+        else await this.closeNativeSurface(stale || { id: result.surfaceId, pageId: page.id });
+        return;
+      }
       console.info("browser.surface.open.completed", { pageId: page.id });
     } catch (error) { if (generation !== this.surfaceGeneration || this.session()?.id !== session.id || this.page()?.id !== page.id) return; await this.failSurface(error, undefined, generation); }
   }
