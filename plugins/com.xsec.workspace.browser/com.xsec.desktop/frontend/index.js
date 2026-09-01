@@ -56,7 +56,7 @@ class BrowserController {
     this.host = host; this.context = host.context || {}; this.key = workspaceKey(this.context);
     this.state = { sessions: [], sessionId: null, userSelected: false, pages: [], groups: [], pageId: null, pageUrl: null, follow: true, focus: false, address: "", error: "", surfaceError: "", busy: "", loading: true, pending: null, observed: null, surfaceState: "" };
     this.timer = 0; this.revision = 0; this.refreshing = false; this.refreshQueued = false; this.refreshChain = Promise.resolve(); this.refreshLoopPromise = Promise.resolve(); this.disposed = false; this.surface = undefined; this.subscription = undefined; this.surfaceGeneration = 0; this.surfaceErrorKey = "";
-    this.moveTimer = 0; this.pendingMove = undefined; this.inputTail = Promise.resolve(); this.surfaceCloseTail = Promise.resolve(); this.surfaceClosePromises = new Map(); this.surfaceTransitionTail = Promise.resolve(); this.surfaceTeardownPromise = undefined; this.closingSurfaceId = ""; this.addressEditPageId = null; this.presentationTail = Promise.resolve(); this.composing = false; this.compositionSurfaceId = ""; this.compositionCancelled = false; this.ignoredText = undefined; this.pressedKeys = new Map(); this.mouseButtons = 0; this.mouseSurfaceId = ""; this.lastPoint = { x: 0, y: 0 }; this.frameSurfaceId = ""; this.nextFrameAckAt = 0; this.focusTail = Promise.resolve(); this.focusTarget = false; this.focusRevision = 0; this.visibilityRevision = 0; this.settingsReady = false; this.settingsRevision = 0;
+    this.moveTimer = 0; this.pendingMove = undefined; this.inputTail = Promise.resolve(); this.surfaceCloseTail = Promise.resolve(); this.surfaceClosePromises = new Map(); this.surfaceTransitionTail = Promise.resolve(); this.surfaceTeardownPromise = undefined; this.closingSurfaceId = ""; this.addressEditPageId = null; this.presentationTails = new Map(); this.canvasContext = undefined; this.composing = false; this.compositionSurfaceId = ""; this.compositionCancelled = false; this.ignoredText = undefined; this.pressedKeys = new Map(); this.mouseButtons = 0; this.mouseSurfaceId = ""; this.lastPoint = { x: 0, y: 0 }; this.frameSurfaceId = ""; this.nextFrameAckAt = 0; this.focusTail = Promise.resolve(); this.focusTarget = false; this.focusRevision = 0; this.visibilityRevision = 0; this.settingsReady = false; this.settingsRevision = 0;
     this.onEscape = (event) => { if (this.focusTarget && event.key === "Escape") void this.setFocus(false).catch((error) => this.fail(error, "presentation")); };
     this.onVisibilityChange = () => void this.handleVisibilityChange(); this.onWindowBlur = () => { const modifiers = this.activeModifierMask(); this.releaseMouseButtons({ modifiers }); this.releasePressedKeys(); };
   }
@@ -128,7 +128,7 @@ class BrowserController {
   updateAddress(force = false) {
     const page = this.page(); const url = page?.url || null; if (url === this.state.pageUrl && !force) return;
     this.state.pageUrl = url; const editing = document.activeElement === this.controls?.address; const editingCurrentPage = editing && this.addressEditPageId === this.state.pageId;
-    if (!editingCurrentPage) { this.state.address = url && url !== "about:blank" ? url : ""; if (editing) this.addressEditPageId = this.state.pageId; }
+    if (!editingCurrentPage) { this.state.address = url && url !== "about:blank" ? url : ""; if (editing) { this.controls.address.value = this.state.address; this.addressEditPageId = this.state.pageId; } }
   }
   async manualRefresh() {
     this.state.error = ""; this.clearTimer(); if (this.refreshing) { this.invalidateRefresh(); await this.refreshLoopPromise; return; } await this.refresh();
@@ -175,7 +175,7 @@ class BrowserController {
       const result = await this.host.request("xsec.browser.surface.open", { browserSessionId: session.id, pageId: page.id, viewportWidth: VIEWPORT_WIDTH, viewportHeight: VIEWPORT_HEIGHT });
       if (!this.surfaceRequestCurrent(generation, session.id, page.id)) { await this.closeNativeSurface({ id: result.surfaceId, pageId: page.id }); return; }
       this.surface = { id: result.surfaceId, stream: result.stream, pageId: page.id, sessionId: session.id }; this.nextFrameAckAt = 0;
-      this.subscription = this.host.onData(result.stream, (raw) => { this.presentationTail = this.presentationTail.then(() => this.present(raw, result.surfaceId), () => this.present(raw, result.surfaceId)).catch((error) => this.failSurface(error, result.surfaceId)); });
+      this.subscription = this.host.onData(result.stream, (raw) => { const tail = this.presentationTails.get(result.surfaceId) || Promise.resolve(); const next = tail.then(() => this.present(raw, result.surfaceId), () => this.present(raw, result.surfaceId)).catch((error) => this.failSurface(error, result.surfaceId)); this.presentationTails.set(result.surfaceId, next); });
       await this.host.request("xsec.browser.surface.ready", { surfaceId: result.surfaceId });
       if (!this.surfaceRequestCurrent(generation, session.id, page.id) || this.surface?.id !== result.surfaceId) {
         const stale = this.surface?.id === result.surfaceId ? this.surface : undefined;
@@ -206,7 +206,7 @@ class BrowserController {
   async presentFrame(frame, surfaceId) {
     try {
       const image = await createImageBitmap(new Blob([frame.jpeg], { type: "image/jpeg" })); if (this.surface?.id !== surfaceId) { image.close(); return; }
-      const firstFrame = this.frameSurfaceId !== surfaceId; this.controls.canvas.width = frame.width; this.controls.canvas.height = frame.height; this.controls.canvas.getContext("2d", { alpha: false })?.drawImage(image, 0, 0, frame.width, frame.height); image.close(); this.frameSurfaceId = surfaceId;
+      const firstFrame = this.frameSurfaceId !== surfaceId; const canvas = this.controls.canvas; if (canvas.width !== frame.width) canvas.width = frame.width; if (canvas.height !== frame.height) canvas.height = frame.height; this.canvasContext ||= canvas.getContext("2d", { alpha: false }); this.canvasContext?.drawImage(image, 0, 0, frame.width, frame.height); image.close(); this.frameSurfaceId = surfaceId;
       if (firstFrame || this.state.surfaceState !== "live") { this.state.surfaceState = "live"; this.render(); }
     } finally { await this.acknowledgeFrame(surfaceId); }
   }
