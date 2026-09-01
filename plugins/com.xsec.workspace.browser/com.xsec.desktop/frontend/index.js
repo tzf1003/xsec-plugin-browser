@@ -54,10 +54,10 @@ class BrowserController {
   constructor(host) {
     this.host = host; this.context = host.context || {}; this.key = workspaceKey(this.context);
     this.state = { sessions: [], sessionId: null, userSelected: false, pages: [], groups: [], pageId: null, pageUrl: null, follow: true, focus: false, address: "", error: "", surfaceError: "", busy: "", loading: true, pending: null, observed: null, surfaceState: "" };
-    this.timer = 0; this.revision = 0; this.refreshing = false; this.refreshQueued = false; this.disposed = false; this.surface = undefined; this.subscription = undefined; this.surfaceGeneration = 0; this.surfaceErrorKey = "";
+    this.timer = 0; this.revision = 0; this.refreshing = false; this.refreshQueued = false; this.refreshChain = Promise.resolve(); this.refreshLoopPromise = Promise.resolve(); this.disposed = false; this.surface = undefined; this.subscription = undefined; this.surfaceGeneration = 0; this.surfaceErrorKey = "";
     this.moveTimer = 0; this.pendingMove = undefined; this.inputTail = Promise.resolve(); this.surfaceCloseTail = Promise.resolve(); this.surfaceTransitionTail = Promise.resolve(); this.composing = false; this.compositionSurfaceId = ""; this.compositionCancelled = false; this.ignoredText = undefined; this.pressedKeys = new Map(); this.mouseButtons = 0; this.mouseSurfaceId = ""; this.frameSurfaceId = ""; this.nextFrameAckAt = 0; this.focusTail = Promise.resolve(); this.focusTarget = false; this.focusRevision = 0; this.visibilityRevision = 0; this.settingsReady = false; this.settingsRevision = 0;
     this.onEscape = (event) => { if (this.focusTarget && event.key === "Escape") void this.setFocus(false).catch((error) => this.fail(error, "presentation")); };
-    this.onVisibilityChange = () => void this.handleVisibilityChange(); this.onWindowBlur = () => this.releasePressedKeys();
+    this.onVisibilityChange = () => void this.handleVisibilityChange(); this.onWindowBlur = () => { this.releasePressedKeys(); this.releaseMouseButtons(); };
   }
   mount(root, context) {
     this.root = root; this.context = context || this.context;
@@ -72,7 +72,7 @@ class BrowserController {
     else await this.teardownWorkspace(visibilityRevision);
   }
   async dispose() {
-    this.disposed = true; this.invalidateRefresh(); this.clearTimer(); this.clearPendingMove(); window.removeEventListener("keydown", this.onEscape); window.removeEventListener("blur", this.onWindowBlur); document.removeEventListener("visibilitychange", this.onVisibilityChange); try { if (!this.settingsPage()) await this.teardownWorkspace(); } finally { this.root?.replaceChildren(); } console.debug("browser.frontend.disposed");
+    this.disposed = true; this.invalidateRefresh(); this.clearTimer(); this.releaseMouseButtons(); this.clearPendingMove(); window.removeEventListener("keydown", this.onEscape); window.removeEventListener("blur", this.onWindowBlur); document.removeEventListener("visibilitychange", this.onVisibilityChange); try { if (!this.settingsPage()) await this.teardownWorkspace(); } finally { this.root?.replaceChildren(); } console.debug("browser.frontend.disposed");
   }
   settingsPage() { return this.context.kind === "settings-page"; }
   binding() { return this.context.workspace?.binding || {}; }
@@ -92,13 +92,19 @@ class BrowserController {
   }
   async handleVisibilityChange() {
     const visibilityRevision = ++this.visibilityRevision;
-    if (!this.visible()) { this.clearTimer(); this.clearPendingMove(); await this.teardownWorkspace(visibilityRevision); if (visibilityRevision === this.visibilityRevision && !this.visible()) { this.render(); console.debug("browser.workspace.hidden"); } return; }
+    if (!this.visible()) { this.clearTimer(); this.releaseMouseButtons(); this.clearPendingMove(); await this.teardownWorkspace(visibilityRevision); if (visibilityRevision === this.visibilityRevision && !this.visible()) { this.render(); console.debug("browser.workspace.hidden"); } return; }
     console.debug("browser.workspace.visible"); await this.manualRefresh();
   }
   async refresh() {
-    if (this.refreshing) { this.refreshQueued = true; return; }
+    if (this.refreshing) { this.refreshQueued = true; return this.refreshLoopPromise; }
     if (!this.visible() || this.state.error) return;
-    const id = ++this.revision; this.refreshing = true; this.refreshQueued = false;
+    this.refreshing = true; this.refreshQueued = false; this.refreshLoopPromise = this.runRefreshLoop(); await this.refreshLoopPromise;
+  }
+  async runRefreshLoop() {
+    try { do { this.refreshChain = this.refreshOnce(); await this.refreshChain; if (this.refreshQueued && this.visible()) this.refreshQueued = false; else break; } while (true); } finally { this.refreshing = false; }
+  }
+  async refreshOnce() {
+    const id = ++this.revision;
     try {
       const sessions = items(await this.host.request("xsec.browser.sessions.list", {}), "浏览器会话"); if (id !== this.revision) return;
       this.state.sessions = sessions; this.state.loading = false;
@@ -108,7 +114,6 @@ class BrowserController {
       if (!session?.live) { await this.resetPages(); this.render(); this.schedule(sessions.some((item) => item.live) ? LIVE_SESSION_POLL_MS : CLOSED_SESSION_POLL_MS); return; }
       await this.refreshPages(session, id); if (id !== this.revision) return; this.state.error = ""; this.render(); this.schedule(PAGE_POLL_MS);
     } catch (error) { if (id === this.revision) { this.state.loading = false; this.fail(error, "sync"); } }
-    finally { this.refreshing = false; if (this.refreshQueued && this.visible()) { this.refreshQueued = false; void this.refresh(); } }
   }
   async refreshPages(session, revision) {
     const snapshot = await this.host.request("xsec.browser.pages.list", { browserSessionId: session.id }); if (revision !== this.revision) return;
@@ -124,7 +129,7 @@ class BrowserController {
     this.state.pageUrl = url; if (document.activeElement !== this.controls?.address) this.state.address = url && url !== "about:blank" ? url : "";
   }
   async manualRefresh() {
-    this.state.error = ""; this.clearTimer(); if (this.refreshing) { this.invalidateRefresh(); return; } await this.refresh();
+    this.state.error = ""; this.clearTimer(); if (this.refreshing) { this.invalidateRefresh(); await this.refreshLoopPromise; return; } await this.refresh();
   }
   fail(error, stage) { console.error(`browser.${stage}.failed`, { message: errorText(error) }); this.state.error = errorText(error); this.render(); }
   async action(name, operation) {
@@ -171,9 +176,9 @@ class BrowserController {
       await this.host.request("xsec.browser.surface.ready", { surfaceId: result.surfaceId });
       if (!this.surfaceRequestCurrent(generation, session.id, page.id) || this.surface?.id !== result.surfaceId) { await this.closeNativeSurface({ id: result.surfaceId, pageId: page.id }); return; }
       console.info("browser.surface.open.completed", { pageId: page.id });
-    } catch (error) { if (generation !== this.surfaceGeneration) return; await this.failSurface(error, undefined, generation); }
+    } catch (error) { if (generation !== this.surfaceGeneration || this.session()?.id !== session.id || this.page()?.id !== page.id) return; await this.failSurface(error, undefined, generation); }
   }
-  async retrySurface() { this.clearSurfaceError(); await this.closeSurface(); await this.ensureSurface(); }
+  async retrySurface() { this.clearSurfaceError(); await this.ensureSurface(); }
   async acknowledgeFrame(surfaceId) {
     const delay = Math.max(0, this.nextFrameAckAt - performance.now()); if (delay) await new Promise((resolve) => window.setTimeout(resolve, delay));
     if (this.surface?.id !== surfaceId) return; this.nextFrameAckAt = performance.now() + FRAME_ACK_INTERVAL_MS; await this.host.request("xsec.browser.surface.acknowledge", { surfaceId });
@@ -205,6 +210,7 @@ class BrowserController {
     const apply = async () => { try { await this.host.request("xsec.browser.presentation.set", { focus }); this.state.focus = focus; if (revision === this.focusRevision) this.render(); } catch (error) { if (revision !== this.focusRevision) return; this.focusTarget = this.state.focus; throw error; } };
     this.focusTail = this.focusTail.then(apply, apply); return this.focusTail;
   }
+  releaseMouseButtons() { const buttons = this.mouseButtons; const surfaceId = this.mouseSurfaceId || this.surface?.id; this.mouseButtons = 0; this.mouseSurfaceId = ""; if (!buttons || !surfaceId) return; const releases = MOUSE_BUTTON_MASKS.flatMap((mask, index) => buttons & mask ? [{ kind: "mouse", event_type: "up", x: 0, y: 0, button: mouseButton(index), buttons: NO_MOUSE_BUTTONS, modifiers: 0 }] : []); void this.queuePointer(surfaceId, releases); }
   sendInput(input, surfaceId = this.surface?.id) {
     if (!surfaceId) return Promise.resolve(); const send = async () => { if (this.surface?.id !== surfaceId) return; try { await this.host.request("xsec.browser.surface.input", { surfaceId, input }); } catch (error) { await this.failSurface(error, surfaceId); } };
     this.inputTail = this.inputTail.then(send, send); return this.inputTail;
@@ -278,9 +284,9 @@ function bindSurfaceInput(controller, canvas, keyboard) {
   canvas.onpointerdown = (event) => { if (event.pointerType === "mouse") { canvas.setPointerCapture(event.pointerId); keyboard.focus({ preventScroll: true }); return; } pressMouse(event, true, event.detail || 1); }; canvas.onmousedown = (event) => pressMouse(event, false, event.detail || 1);
   const releaseMouse = async (event) => { const mask = mouseButtonMask(event.button); if (!mask || !(controller.mouseButtons & mask)) return; const move = controller.takePendingMove(); const surfaceId = controller.mouseSurfaceId; controller.mouseButtons = event.buttons; if (!event.buttons) controller.mouseSurfaceId = ""; const point = controller.point(event); await controller.queuePointer(surfaceId, [...(move ? [move] : []), { kind: "mouse", event_type: "up", ...point, button: mouseButton(event.button), buttons: event.buttons, click_count: event.detail || 1, modifiers: eventModifiers(event) }]); };
   canvas.onmouseup = (event) => void releaseMouse(event); canvas.onpointercancel = (event) => { const buttons = controller.mouseButtons; const move = controller.takePendingMove(); const surfaceId = controller.mouseSurfaceId; controller.mouseButtons = NO_MOUSE_BUTTONS; controller.mouseSurfaceId = ""; if (!buttons) return; const point = controller.point(event); const releases = MOUSE_BUTTON_MASKS.flatMap((mask, index) => buttons & mask ? [{ kind: "mouse", event_type: "up", ...point, button: mouseButton(index), buttons: NO_MOUSE_BUTTONS, modifiers: eventModifiers(event) }] : []); void controller.queuePointer(surfaceId, [...(move ? [move] : []), ...releases]); };
-  canvas.onpointermove = (event) => { if (event.buttons && event.buttons !== controller.mouseButtons) return; const point = controller.point(event); controller.queueMove({ kind: "mouse", event_type: "move", ...point, button: "none", buttons: event.buttons, modifiers: eventModifiers(event) }); };
+  canvas.onpointermove = (event) => { if (event.buttons && event.buttons !== controller.mouseButtons) return; const point = controller.point(event); controller.queueMove({ kind: "mouse", event_type: "move", ...point, button: "none", buttons: event.buttons, modifiers: eventModifiers(event) }); }; canvas.onlostpointercapture = () => controller.releaseMouseButtons();
   canvas.onwheel = (event) => { event.preventDefault(); const move = controller.takePendingMove(); const point = controller.point(event); void controller.queuePointer(controller.surface?.id, [...(move ? [move] : []), { kind: "mouse", event_type: "wheel", ...point, button: "none", modifiers: eventModifiers(event), delta_x: event.deltaX, delta_y: event.deltaY }]); };
-  keyboard.onkeydown = (event) => { if (event.isComposing || controller.composing || event.key === "Process") return; if (controller.focusTarget && event.key === "Escape") { event.preventDefault(); event.stopPropagation(); void controller.setFocus(false).catch((error) => controller.fail(error, "presentation")); return; } const paste = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v"; if (paste) return; const altGraph = event.getModifierState?.("AltGraph"); const printable = event.key.length === 1 && !event.metaKey && (!event.ctrlKey && !event.altKey || altGraph || event.altKey && !event.ctrlKey); if (!printable) event.preventDefault(); const key = event.code || event.key; const input = { kind: "key", event_type: "down", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }; controller.pressedKeys.set(key, input); void controller.sendInput(input); };
+  keyboard.onkeydown = (event) => { if (event.isComposing || controller.composing || event.key === "Process") return; if (controller.focusTarget && event.key === "Escape") { event.preventDefault(); event.stopPropagation(); void controller.setFocus(false).catch((error) => controller.fail(error, "presentation")); return; } const paste = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v" || event.shiftKey && event.key === "Insert"; if (paste) return; const altGraph = event.getModifierState?.("AltGraph"); const printable = event.key.length === 1 && !event.metaKey && (!event.ctrlKey && !event.altKey || altGraph || event.altKey && !event.ctrlKey); if (!printable) event.preventDefault(); const key = event.code || event.key; const input = { kind: "key", event_type: "down", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }; controller.pressedKeys.set(key, input); void controller.sendInput(input); };
   keyboard.onkeyup = (event) => { const key = event.code || event.key; if (!controller.pressedKeys.delete(key)) return; void controller.sendInput({ kind: "key", event_type: "up", key: event.key, code: event.code, modifiers: eventModifiers(event), windows_virtual_key_code: event.keyCode, auto_repeat: event.repeat }); };
   keyboard.onblur = () => controller.releasePressedKeys();
   keyboard.oncompositionstart = () => { controller.composing = true; controller.compositionCancelled = false; controller.compositionSurfaceId = controller.surface?.id || ""; }; keyboard.oncompositionend = (event) => { const accepted = !controller.compositionCancelled && controller.surface?.id === controller.compositionSurfaceId; controller.composing = false; controller.compositionCancelled = false; controller.compositionSurfaceId = ""; controller.ignoredText = event.data; if (accepted && event.data) controller.sendInput({ kind: "insert_text", text: event.data }); event.target.value = ""; };
