@@ -268,7 +268,7 @@ function icon(name, label, handler) {
 function workspaceControls(controller) {
   const app = element("main", "app"); const session = element("header", "session"); const select = element("select"); const sessionDot = element("i"); const sessionText = element("span"); const sessionState = element("span", "session-state");
   select.setAttribute("aria-label", "浏览器会话"); select.onchange = () => void controller.chooseSession(select.value).catch((error) => controller.fail(error, "session-select")); sessionState.append(sessionDot, sessionText);
-  const follow = icon("radio", "跟随 Agent", () => { controller.state.follow = !controller.state.follow; if (controller.state.follow) controller.state.pending = null; void controller.manualRefresh(); });
+  const follow = icon("radio", "跟随 Agent", () => { controller.state.follow = !controller.state.follow; if (controller.state.follow) controller.state.pending = null; controller.render(); void controller.manualRefresh(); });
   const focus = icon("maximize2", "进入浏览器专注模式", () => void controller.setFocus(!controller.focusTarget).catch((error) => controller.fail(error, "presentation")));
   const refresh = icon("refreshCw", "重新读取浏览器会话", () => void controller.manualRefresh()); session.append(select, sessionState, follow, focus, refresh);
   const tabbar = element("div", "tabbar"); const tabs = element("div", "tabs"); tabs.setAttribute("role", "group"); tabs.setAttribute("aria-label", "浏览器标签页"); const newTab = element("button", "new"); newTab.type = "button"; newTab.setAttribute("aria-label", "新建浏览器标签页"); newTab.title = newTab.getAttribute("aria-label"); newTab.append(lucideIcon("plus")); newTab.onclick = () => void controller.createPage(); tabbar.append(tabs, newTab);
