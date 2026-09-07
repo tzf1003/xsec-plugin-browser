@@ -26,6 +26,9 @@ jobs:
           const root = JSON.parse(fs.readFileSync("plugin.json", "utf8"));
           const catalog = JSON.parse(fs.readFileSync(".codex-plugin/plugin.json", "utf8"));
           const extension = root.extensions?.["com.xsec.desktop"];
+          if (["mcp.json", "skills"].some((path) => fs.existsSync(path))) {
+            throw new Error("Browser Host packages cannot include portable MCP or Skill entrypoints");
+          }
           const expectedMethods = [
             "xsec.browser.sessions.list", "xsec.browser.pages.list", "xsec.browser.page.create",
             "xsec.browser.page.close", "xsec.browser.page.navigate", "xsec.browser.page.action",
